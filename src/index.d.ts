@@ -292,15 +292,3 @@ export class AOThicknessMapGenerator {
 	thicknessRadius: number;
 
 }
-
-export class UVGenerator {
-
-	constructor();
-
-	init(): Promise<void>;
-
-	generate( geometries: Array<BufferGeometry>, onProgress?: ( progress: number ) => void ): Promise<void>;
-
-	channel: number;
-
-}
