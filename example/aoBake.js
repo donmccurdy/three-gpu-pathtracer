@@ -13,7 +13,9 @@ import {
 	MeshPhysicalMaterial,
 	EquirectangularReflectionMapping,
 	MeshBasicMaterial,
-	NoColorSpace
+	NoColorSpace,
+	NearestFilter,
+	LinearMipmapLinearFilter
 } from 'three';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
@@ -23,8 +25,8 @@ import Stats from 'three/examples/jsm/libs/stats.module.js';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import { AOThicknessMapGenerator } from '../src/utils/AOThicknessMapGenerator.js';
 import { WebIO } from '@gltf-transform/core';
-import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
-import { unwrap } from '@gltf-transform/functions';
+import { ALL_EXTENSIONS, KHRMaterialsVolume } from '@gltf-transform/extensions';
+import { unwrap, cloneDocument } from '@gltf-transform/functions';
 import { DocumentView } from '@gltf-transform/view';
 import * as watlas from 'watlas';
 
@@ -35,15 +37,16 @@ let statusEl, totalSamples = 0;
 let aoGenerator, aoTarget, aoTexture, gui, aoMaterial;
 let background;
 let quad;
-let io, gltfDocument;
+let io, sourceDocument;
 
 const params = {
 	transmission: false,
 	displayMap: false,
 };
 
-const AO_THICKNESS_TEXTURE_SIZE = 1024;
-const MAX_SAMPLES = 1000;
+const TEXTURE_SIZE = 1024;
+const TEXTURE_CHANNEL = 2;
+const MAX_SAMPLES = 50;
 
 init();
 
@@ -77,19 +80,21 @@ async function init() {
 	const url = '/FlightHelmet+clean.glb';
 
 	// init ao texture
-	aoTarget = new WebGLRenderTarget( AO_THICKNESS_TEXTURE_SIZE, AO_THICKNESS_TEXTURE_SIZE, {
+	aoTarget = new WebGLRenderTarget( TEXTURE_SIZE, TEXTURE_SIZE, {
 		type: FloatType,
 		colorSpace: NoColorSpace,
 		generateMipmaps: true,
 		format: RGBAFormat,
+		minFilter: LinearMipmapLinearFilter,
+		maxFilter: NearestFilter,
 	} );
 	aoTexture = aoTarget.texture;
-	aoTexture.channel = 2;
+	aoTexture.channel = TEXTURE_CHANNEL;
 
 	// init ao generator
 	aoGenerator = new AOThicknessMapGenerator( renderer );
 	aoGenerator.samples = MAX_SAMPLES;
-	aoGenerator.channel = 2;
+	aoGenerator.channel = TEXTURE_CHANNEL;
 	aoGenerator.aoRadius = 2;
 	aoGenerator.thicknessRadius = 0.5;
 
@@ -103,9 +108,7 @@ async function init() {
 	} );
 
 	// quad for rendering texture result
-	quad = new FullScreenQuad( new MeshBasicMaterial( {
-		map: aoTexture,
-	} ) );
+	quad = new FullScreenQuad( new MeshBasicMaterial( { map: aoTexture } ) );
 
 	const envPromise = new RGBELoader()
 		.loadAsync( ENV_URL )
@@ -126,11 +129,11 @@ async function init() {
 		.read( url )
 		.then( async _document => {
 
-			gltfDocument = _document
+			sourceDocument = _document
 
 			console.time( 'unwrap' );
 			await _document.transform(
-				unwrap( { watlas, texcoord: 2, groupBy: 'scene' } )
+				unwrap( { watlas, groupBy: 'scene', texcoord: TEXTURE_CHANNEL } )
 			);
 			console.timeEnd( 'unwrap' );
 
@@ -183,7 +186,7 @@ async function init() {
 	gui = new GUI();
 	gui.add( params, 'transmission' );
 	gui.add( params, 'displayMap' );
-	gui.add( { onExport }, 'onExport' );
+	gui.add( { download }, 'download' );
 
 	stats = new Stats();
 	document.body.appendChild( stats.domElement );
@@ -254,7 +257,7 @@ function animate() {
 
 	} else {
 
-		aoTexture.channel = 2;
+		aoTexture.channel = TEXTURE_CHANNEL;
 		renderer.render( scene, camera );
 
 	}
@@ -267,66 +270,92 @@ function animate() {
 
 }
 
-async function onExport() {
+async function download() {
 
-	console.log( aoTexture );
+	const image = await renderTargetToBytes( aoTarget );
+	const targetDocument = cloneDocument( sourceDocument );
 
-	const { width, height } = aoTexture.image;
+	addAOThicknessTextureToDocument( targetDocument, image );
 
-	const aoPixelsFloat = new Float32Array( width * height * 4 );
-	const aoPixelsByte = new Uint32Array( width * height * 4 );
+	const bytes = await io.writeBinary( targetDocument );
+	const blob = new Blob( [ bytes ], { type: 'application/octet-stream' } );
 
-	renderer.readRenderTargetPixels( aoTarget, 0, 0, width, height, aoPixelsFloat );
+	downloadBlob( blob, 'baked.glb' );
 
-	for ( let i = 0; i < aoPixelsFloat.length; i ++ ) {
+}
 
-		aoPixelsByte[ i ] = aoPixelsFloat[ i ] * 255;
+async function renderTargetToBytes( renderTarget ) {
+
+	const texture = renderTarget.texture;
+	const { width, height } = texture.image;
+
+	const pixelsFloat = new Float32Array( width * height * 4 );
+	const pixels = new Uint8Array( width * height * 4 );
+
+	renderer.readRenderTargetPixels( renderTarget, 0, 0, width, height, pixelsFloat );
+
+	for ( let i = 0; i < pixelsFloat.length; i ++ ) {
+
+		pixels[ i ] = pixelsFloat[ i ] * 255;
 
 	}
 
-	console.log( { aoPixelsByte } );
-
 	const canvas = new OffscreenCanvas( width, height );
+	const ctx = canvas.getContext( '2d' );
 
-	const ctx = canvas.getContext( '2d', { willReadFrequently: true } );
+	if ( texture.flipY === true ) {
 
-	if ( aoTexture.flipY === true ) {
-
-		ctx.translate( 0, canvas.height );
+		ctx.translate( 0, height );
 		ctx.scale( 1, - 1 );
 
 	}
 
-	const imageData = ctx.getImageData( 0, 0, canvas.width, canvas.height );
+	const imageData = ctx.getImageData( 0, 0, width, height );
 
 	for ( let i = 0; i < imageData.data.length; i += 4 ) {
 
-		imageData.data[ i + 0 ] = aoPixelsByte[ i + 0 ];
-		imageData.data[ i + 1 ] = aoPixelsByte[ i + 1 ];
-		imageData.data[ i + 2 ] = aoPixelsByte[ i + 2 ];
-		imageData.data[ i + 3 ] = aoPixelsByte[ i + 3 ];
+		imageData.data[ i + 0 ] = pixels[ i + 0 ];
+		imageData.data[ i + 1 ] = pixels[ i + 1 ];
+		imageData.data[ i + 2 ] = pixels[ i + 2 ];
+		imageData.data[ i + 3 ] = pixels[ i + 3 ];
 
 	}
 
 	ctx.putImageData( imageData, 0, 0 );
 
-	const imageBlob = await canvas.convertToBlob( { type: 'image/png' } );
-	const imageBuffer = await imageBlob.arrayBuffer();
+	const blob = await canvas.convertToBlob( { type: 'image/png' } );
+	const buffer = await blob.arrayBuffer();
+	return new Uint8Array( buffer );
 
-	const aoTextureDef = gltfDocument.createTexture( 'ao' )
-		.setImage( new Uint8Array( imageBuffer ) )
+}
+
+function addAOThicknessTextureToDocument( document, image ) {
+
+	const textureDef = document.createTexture( 'ao' )
+		.setImage( image )
 		.setMimeType( 'image/png' );
 
-	if ( gltfDocument.getRoot().listMaterials().length === 0 ) {
+	const volumeExtension = document.createExtension( KHRMaterialsVolume );
 
-		const materialDef = gltfDocument.createMaterial()
-			.setOcclusionTexture( aoTextureDef )
-			.setOcclusionStrength( 1.0 );
+	const volume = volumeExtension.createVolume()
+		.setThicknessTexture( textureDef )
+		.setThicknessFactor( 1.0 );
+
+	volume.getThicknessTextureInfo()
+		.setTexCoord( TEXTURE_CHANNEL );
+
+	// If document has no materials, create one and assign to all primitives.
+	if ( document.getRoot().listMaterials().length === 0 ) {
+
+		const materialDef = document.createMaterial()
+			.setOcclusionTexture( textureDef )
+			.setOcclusionStrength( 1.0 )
+			.setExtension( 'KHR_materials_volume', volume );
 
 		materialDef.getOcclusionTextureInfo()
-			.setTexCoord( 2 );
+			.setTexCoord( TEXTURE_CHANNEL );
 
-		for ( const mesh of gltfDocument.getRoot().listMeshes() ) {
+		for ( const mesh of document.getRoot().listMeshes() ) {
 
 			for ( const prim of mesh.listPrimitives() ) {
 
@@ -336,41 +365,57 @@ async function onExport() {
 
 		}
 
-	} else {
+		return;
 
-		for ( const materialDef of gltfDocument.getRoot().listMaterials() ) {
+	}
 
-			materialDef
-				.setOcclusionTexture( aoTextureDef )
-				.setOcclusionStrength( 1.0 );
+	// Update existing materials.
 
-			materialDef.getOcclusionTextureInfo()
-				.setTexCoord( 2 );
+	for ( const materialDef of document.getRoot().listMaterials() ) {
+
+		materialDef
+			.setOcclusionTexture( textureDef )
+			.setOcclusionStrength( 1.0 );
+
+		materialDef.getOcclusionTextureInfo()
+			.setTexCoord( TEXTURE_CHANNEL );
+
+		if ( materialDef.getExtension( 'KHR_materials_volume' ) ) {
+
+			materialDef.getExtension( 'KHR_materials_volume' )
+				.setThicknessTexture( textureDef )
+				.setThicknessFactor( 1.0 );
+
+			materialDef.getExtension( 'KHR_materials_volume' )
+				.getThicknessTextureInfo()
+				.setTexCoord( TEXTURE_CHANNEL );
+
+		} else {
+
+			materialDef.setExtension( 'KHR_materials_volume', volume );
 
 		}
 
 	}
 
-	const outputBytes = await io.writeBinary( gltfDocument );
-	const outputBlob = new Blob( [ outputBytes ], { type: 'application/octet-stream' } );
-
-	save( outputBlob, 'baked.glb' );
-
-	console.log( 'glb', outputBytes );
-
 }
 
+let _anchorEl
 
-const link = document.createElement( 'a' );
-link.style.display = 'none';
-document.body.appendChild( link ); // Firefox workaround, see #6594
+function downloadBlob( blob, filename ) {
 
-function save( blob, filename ) {
+	if ( ! _anchorEl ) {
 
-	link.href = URL.createObjectURL( blob );
-	link.download = filename;
-	link.click();
+		_anchorEl = document.createElement( 'a' );
+		_anchorEl.style.display = 'none';
+		document.body.appendChild( _anchorEl );
 
-	URL.revokeObjectURL( link.href );
+	}
+
+	_anchorEl.href = URL.createObjectURL( blob );
+	_anchorEl.download = filename;
+	_anchorEl.click();
+
+	URL.revokeObjectURL( _anchorEl.href );
 
 }
